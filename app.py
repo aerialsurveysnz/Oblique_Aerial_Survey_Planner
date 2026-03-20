@@ -833,6 +833,341 @@ photo_spacing = footprint_along × (1 − forward_overlap_fraction)
     """)
 
 # ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+st.subheader("📤 Export Results")
+st.caption("Download the current survey summary and per-camera specs as Excel, Word, or PDF.")
+
+import io
+import datetime
+
+def build_export_data():
+    """Collect all summary values into plain dicts for export."""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    summary = {
+        "Export date": timestamp,
+        "Camera name": camera_name,
+        "Arrangement": arrangement,
+        "Tilt from nadir (°)": round(tilt_from_nadir, 1),
+        "Altitude AGL (m)": round(altitude_m, 1),
+        "Aircraft speed (m/s)": round(speed_ms, 1),
+        "Forward overlap (%)": forward_overlap_pct,
+        "Sidelap (%)": sidelap_pct,
+        "Sensor width (mm)": sensor_w_mm,
+        "Sensor height (mm)": sensor_h_mm,
+        "Image width (px)": img_w_px,
+        "Image height (px)": img_h_px,
+        "Focal length (mm)": focal_mm,
+    }
+
+    if mc:
+        summary.update({
+            "Combined swath (m)": round(mc.combined_swath_m, 1),
+            "Line spacing (m)": round(mc.recommended_line_spacing_m, 1),
+            "Photo spacing (m)": round(mc.recommended_photo_spacing_m, 1),
+            "Exposure interval (s)": round(mc.photo_interval_s, 2),
+            "Sidelap achieved (%)": round(mc.sidelap_achieved * 100, 1),
+            "Fwd overlap near edge (%)": round(mc.forward_overlap_near * 100, 1),
+            "Fwd overlap centre (%)": round(mc.forward_overlap_centre * 100, 1),
+            "Fwd overlap far edge (%)": round(mc.forward_overlap_far * 100, 1),
+            "Reciprocal flying recommended": "Yes" if mc.reciprocal_recommended else "No",
+        })
+
+    if cam_solutions:
+        sol0 = cam_solutions[0]
+        summary.update({
+            "Near-edge GSD (cm/px)": round(sol0.near_gsd_m * 100, 2),
+            "Centre GSD (cm/px)": round(sol0.centre_gsd_m * 100, 2),
+            "Far-edge GSD (cm/px)": round(sol0.far_gsd_m * 100, 2),
+            "Near angle from vertical (°)": round(sol0.near_angle_deg, 1),
+            "Near angle from horizontal (°)": round(90.0 - sol0.near_angle_deg, 1),
+            "Centre angle from vertical (°)": round(sol0.centre_angle_deg, 1),
+            "Centre angle from horizontal (°)": round(90.0 - sol0.centre_angle_deg, 1),
+        })
+
+    per_camera = []
+    for i, (lbl, sol) in enumerate(zip(labels, cam_solutions)):
+        per_camera.append({
+            "Camera": lbl,
+            "Side": "Right" if tilts[i] >= 0 else "Left",
+            "Near Edge (m)": round(sol.near_edge_m, 1),
+            "Centre (m)": round(sol.centre_m, 1),
+            "Far Edge (m)": round(sol.far_edge_m, 1),
+            "Near Slant (m)": round(sol.near_slant_m, 1),
+            "Centre Slant (m)": round(sol.centre_slant_m, 1),
+            "Far Slant (m)": round(sol.far_slant_m, 1),
+            "Near angle from vertical (°)": round(sol.near_angle_deg, 1),
+            "Near angle from horizontal (°)": round(90.0 - sol.near_angle_deg, 1),
+            "Centre angle from vertical (°)": round(sol.centre_angle_deg, 1),
+            "Centre angle from horizontal (°)": round(90.0 - sol.centre_angle_deg, 1),
+            "Near GSD (cm/px)": round(sol.near_gsd_m * 100, 2),
+            "Centre GSD (cm/px)": round(sol.centre_gsd_m * 100, 2),
+            "Far GSD (cm/px)": round(sol.far_gsd_m * 100, 2),
+            "Footprint Across (m)": round(sol.footprint_across_m, 1),
+            "Footprint Along (m)": round(sol.footprint_along_m, 1),
+            "Pixel Size (µm)": round(sol.pixel_size_mm * 1000, 2),
+            "Half FOV Across (°)": round(sol.half_fov_across_deg, 2),
+        })
+
+    return summary, per_camera
+
+
+def make_excel(summary, per_camera):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+
+    # --- Summary sheet ---
+    ws1 = wb.active
+    ws1.title = "Summary"
+    hdr_font = Font(bold=True, color="FFFFFF", name="Arial", size=11)
+    hdr_fill = PatternFill("solid", start_color="2E4057")
+    key_font = Font(bold=True, name="Arial", size=10)
+    val_font = Font(name="Arial", size=10)
+    thin = Side(style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    ws1.append(["Oblique Survey Planner — Summary"])
+    ws1["A1"].font = Font(bold=True, name="Arial", size=14)
+    ws1.append([])
+
+    ws1.append(["Parameter", "Value"])
+    for cell in ws1[3]:
+        cell.font = hdr_font
+        cell.fill = hdr_fill
+        cell.alignment = Alignment(horizontal="center")
+        cell.border = border
+
+    for row_idx, (k, v) in enumerate(summary.items(), start=4):
+        ws1.append([k, v])
+        ws1.cell(row=row_idx, column=1).font = key_font
+        ws1.cell(row=row_idx, column=2).font = val_font
+        for col in [1, 2]:
+            ws1.cell(row=row_idx, column=col).border = border
+
+    ws1.column_dimensions["A"].width = 36
+    ws1.column_dimensions["B"].width = 28
+
+    # --- Per-camera sheet ---
+    ws2 = wb.create_sheet("Per-Camera Geometry")
+    if per_camera:
+        headers = list(per_camera[0].keys())
+        ws2.append(headers)
+        for cell in ws2[1]:
+            cell.font = hdr_font
+            cell.fill = hdr_fill
+            cell.alignment = Alignment(horizontal="center")
+            cell.border = border
+        for row in per_camera:
+            ws2.append(list(row.values()))
+        for col_idx in range(1, len(headers) + 1):
+            ws2.column_dimensions[get_column_letter(col_idx)].width = 22
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+def make_word(summary, per_camera):
+    from docx import Document
+    from docx.shared import Pt, RGBColor, Inches
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    doc = Document()
+
+    # Title
+    title = doc.add_heading("Oblique Survey Planner — Export", 0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_paragraph(f"Generated: {summary.get('Export date', '')}")
+    doc.add_paragraph("")
+
+    # Summary table
+    doc.add_heading("Survey Summary", level=1)
+    tbl = doc.add_table(rows=1, cols=2)
+    tbl.style = "Table Grid"
+    hdr_cells = tbl.rows[0].cells
+    hdr_cells[0].text = "Parameter"
+    hdr_cells[1].text = "Value"
+    for cell in hdr_cells:
+        run = cell.paragraphs[0].runs[0]
+        run.bold = True
+        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        tc = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:fill"), "2E4057")
+        shd.set(qn("w:val"), "clear")
+        tcPr.append(shd)
+
+    for k, v in summary.items():
+        row_cells = tbl.add_row().cells
+        row_cells[0].text = str(k)
+        row_cells[1].text = str(v)
+
+    tbl.columns[0].width = Inches(3.2)
+    tbl.columns[1].width = Inches(2.8)
+
+    doc.add_paragraph("")
+
+    # Per-camera table
+    if per_camera:
+        doc.add_heading("Per-Camera Geometry", level=1)
+        headers = list(per_camera[0].keys())
+        tbl2 = doc.add_table(rows=1, cols=len(headers))
+        tbl2.style = "Table Grid"
+        hdr_cells2 = tbl2.rows[0].cells
+        for i, h in enumerate(headers):
+            hdr_cells2[i].text = h
+            run = hdr_cells2[i].paragraphs[0].runs[0]
+            run.bold = True
+            run.font.size = Pt(8)
+            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+            tc = hdr_cells2[i]._tc
+            tcPr = tc.get_or_add_tcPr()
+            shd = OxmlElement("w:shd")
+            shd.set(qn("w:fill"), "2E4057")
+            shd.set(qn("w:val"), "clear")
+            tcPr.append(shd)
+        for row in per_camera:
+            row_cells = tbl2.add_row().cells
+            for i, v in enumerate(row.values()):
+                row_cells[i].text = str(v)
+                row_cells[i].paragraphs[0].runs[0].font.size = Pt(8)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+def make_pdf(summary, per_camera):
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import cm
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    )
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            leftMargin=1.5*cm, rightMargin=1.5*cm,
+                            topMargin=2*cm, bottomMargin=2*cm)
+    styles = getSampleStyleSheet()
+    hdr_style = ParagraphStyle("hdr", parent=styles["Heading1"],
+                               fontSize=16, spaceAfter=6)
+    sub_style = ParagraphStyle("sub", parent=styles["Heading2"],
+                               fontSize=12, spaceAfter=4)
+    body_style = styles["Normal"]
+
+    story = []
+    story.append(Paragraph("Oblique Survey Planner — Export", hdr_style))
+    story.append(Paragraph(f"Generated: {summary.get('Export date', '')}", body_style))
+    story.append(Spacer(1, 0.4*cm))
+
+    # Summary table
+    story.append(Paragraph("Survey Summary", sub_style))
+    sum_data = [["Parameter", "Value"]] + [[k, str(v)] for k, v in summary.items()]
+    sum_table = Table(sum_data, colWidths=[10*cm, 7*cm])
+    sum_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2E4057")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F0F4F8")]),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(sum_table)
+    story.append(Spacer(1, 0.6*cm))
+
+    # Per-camera table — landscape page
+    if per_camera:
+        story.append(PageBreak())
+        story.append(Paragraph("Per-Camera Geometry", sub_style))
+        headers = list(per_camera[0].keys())
+        cam_data = [headers] + [list(r.values()) for r in per_camera]
+        col_w = (A4[1] - 3*cm) / len(headers)  # landscape width minus margins
+        cam_table = Table(cam_data, colWidths=[col_w] * len(headers), repeatRows=1)
+        cam_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2E4057")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F0F4F8")]),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("WORDWRAP", (0, 0), (-1, -1), True),
+        ]))
+        story.append(cam_table)
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
+
+
+if cam_solutions:
+    summary_data, per_camera_data = build_export_data()
+    fname_base = scenario_name if scenario_name else "survey"
+
+    ex1, ex2, ex3 = st.columns(3)
+
+    with ex1:
+        try:
+            xlsx_bytes = make_excel(summary_data, per_camera_data)
+            st.download_button(
+                label="⬇️ Download Excel (.xlsx)",
+                data=xlsx_bytes,
+                file_name=f"{fname_base}_survey.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as e:
+            st.error(f"Excel export failed: {e}")
+
+    with ex2:
+        try:
+            docx_bytes = make_word(summary_data, per_camera_data)
+            st.download_button(
+                label="⬇️ Download Word (.docx)",
+                data=docx_bytes,
+                file_name=f"{fname_base}_survey.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        except Exception as e:
+            st.error(f"Word export failed: {e}")
+
+    with ex3:
+        try:
+            pdf_bytes = make_pdf(summary_data, per_camera_data)
+            st.download_button(
+                label="⬇️ Download PDF",
+                data=pdf_bytes,
+                file_name=f"{fname_base}_survey.pdf",
+                mime="application/pdf",
+            )
+        except Exception as e:
+            st.error(f"PDF export failed: {e}")
+
+st.markdown("---")
+
+# ---------------------------------------------------------------------------
 # Footer
 # ---------------------------------------------------------------------------
 
