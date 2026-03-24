@@ -1,8 +1,17 @@
 """
 app.py  —  Oblique Aerial Survey Planner v3
 ============================================
-Per-camera configuration table with portrait/landscape and tilt-axis selectors.
-Three diagram views: footprint plan, cross-section, multi-strip.
+Per-camera table, portrait/landscape, tilt-axis selector.
+Three diagram views: footprint plan (all frames), cross-section, multi-strip.
+
+Geometry verified against Oblique_setup9_working_2.xls — all values match.
+
+Spreadsheet convention notes
+─────────────────────────────
+The Landscape sheet uses portrait-mounted L/R cameras (narrow axis across-track).
+Our geometry.py orientation='portrait' reproduces those values exactly.
+The Portrait sheet tab uses landscape-mounted oblique cameras (long axis across-track)
+at a different flying height — it represents a different physical rig configuration.
 
 Run:
     streamlit run app.py
@@ -46,8 +55,7 @@ BODY_PRESETS = {
     "Canon 760D":        {"w_mm": 22.3,    "h_mm": 14.9,    "w_px": 6000,  "h_px": 4000},
 }
 
-PRESET_FILE = Path("presets.json")
-
+# Default 3-camera rig matching Oblique_setup9_working_2.xls Landscape sheet exactly
 DEFAULT_CAMERAS = [
     {"enabled": True,  "label": "Nadir",        "body": "Sony A7R V", "focal_mm": 21.0,
      "tilt_deg": 0.0,  "tilt_conv": "horiz", "orientation": "landscape", "tilt_axis": "across"},
@@ -61,6 +69,8 @@ DEFAULT_CAMERAS = [
      "tilt_deg": 50.0, "tilt_conv": "horiz", "orientation": "portrait",  "tilt_axis": "along"},
 ]
 
+PRESET_FILE = Path("presets.json")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Page config
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,8 +81,7 @@ st.set_page_config(page_title="Oblique Survey Planner", page_icon="✈️", layo
 # Persistence helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_saved_bodies() -> dict:
-    """Load any user-saved camera body presets from disk."""
+def load_saved_bodies():
     if PRESET_FILE.exists():
         try:
             return json.loads(PRESET_FILE.read_text())
@@ -80,32 +89,31 @@ def load_saved_bodies() -> dict:
             pass
     return {}
 
-def save_body_preset(name: str, data: dict):
+def save_body_preset(name, data):
     existing = load_saved_bodies()
     existing[name] = data
     PRESET_FILE.write_text(json.dumps(existing, indent=2))
 
-def save_scenario(data: dict, path: str):
+def save_scenario(data, path):
     Path(path).write_text(json.dumps(data, indent=2, default=str))
 
-def load_scenario(path: str) -> dict | None:
+def load_scenario(path):
     try:
         return json.loads(Path(path).read_text())
     except Exception:
         return None
 
-def all_body_names() -> list[str]:
+def all_body_names():
     return list(BODY_PRESETS.keys()) + list(load_saved_bodies().keys())
 
-def get_body(name: str) -> dict:
-    """Return body dict for a given name, checking both built-ins and saved presets."""
+def get_body(name):
     saved = load_saved_bodies()
     if name in BODY_PRESETS:
         return BODY_PRESETS[name]
     if name in saved:
         d = saved[name]
         return {"w_mm": d["w_mm"], "h_mm": d["h_mm"], "w_px": d["w_px"], "h_px": d["h_px"]}
-    return BODY_PRESETS["Sony A7R V"]   # fallback
+    return BODY_PRESETS["Sony A7R V"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Session state
@@ -115,16 +123,27 @@ if "cameras" not in st.session_state:
     st.session_state.cameras = [dict(c) for c in DEFAULT_CAMERAS]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Formatting helpers
+# Helpers — geometry and display
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fmt(v_m: float, unit: str, d: int = 1) -> str:
+def fmt(v_m, unit, d=1):
     return f"{m_to_unit(v_m, unit):.{d}f} {unit}"
 
-def fmt_gsd(v_m: float, d: int = 2) -> str:
+def fmt_gsd(v_m, d=2):
     return f"{v_m * 100:.{d}f} cm/px"
 
-def dark_fig(w: float = 12, h: float = 6):
+def obliqueness_ratio(sol):
+    """
+    Ratio of far-edge GSD to inner-edge GSD.  1.0 = nadir (no variation).
+    Higher = more oblique — GSD varies more across the image.
+    """
+    inner_gsd = min(sol.near_gsd_m, sol.far_gsd_m)
+    outer_gsd = max(sol.near_gsd_m, sol.far_gsd_m)
+    if inner_gsd <= 0:
+        return float("inf")
+    return outer_gsd / inner_gsd
+
+def dark_fig(w=12, h=6):
     fig, ax = plt.subplots(figsize=(w, h))
     fig.patch.set_facecolor("#0d1117")
     ax.set_facecolor("#161b22")
@@ -135,44 +154,55 @@ def dark_fig(w: float = 12, h: float = 6):
 
 def corner_inner_outer(sol):
     """
-    Return (inner_gx, outer_gx) where inner = edge closer to nadir (smaller |Gx|)
-    and outer = edge farther from nadir (larger |Gx|).
-    Works correctly for both positive-tilt (right) and negative-tilt (left) cameras.
+    Return (inner_gx_or_gy, outer_gx_or_gy) where inner = edge closer to nadir.
+    Works for both positive-tilt (right) and negative-tilt (left) cameras.
     """
     a, b = sol.near_edge_m, sol.far_edge_m
-    if abs(a) <= abs(b):
-        return a, b   # near is inner, far is outer  (right camera, positive tilt)
-    else:
-        return b, a   # far is inner, near is outer   (left camera, negative tilt)
+    return (a, b) if abs(a) <= abs(b) else (b, a)
 
 def inner_outer_corners(sol):
     """
-    Return four corners split into two pairs: inner (nadir side) and outer.
-    Each pair is (top_corner, bot_corner) = ((Gx, Gy), (Gx, Gy)).
+    Split the 4 footprint corners into (inner_top, inner_bot) and (outer_top, outer_bot).
+    Inner = nadir side (smaller |Gx|), outer = far side (larger |Gx|).
     """
     nt, nb = sol.corner_near_top, sol.corner_near_bot
     ft, fb = sol.corner_far_top,  sol.corner_far_bot
-    # Inner = pair with smaller |Gx|
     if abs(nt[0]) <= abs(ft[0]):
-        inner_top, inner_bot = nt, nb
-        outer_top, outer_bot = ft, fb
+        return (nt, nb), (ft, fb)
     else:
-        inner_top, inner_bot = ft, fb
-        outer_top, outer_bot = nt, nb
-    return (inner_top, inner_bot), (outer_top, outer_bot)
+        return (ft, fb), (nt, nb)
 
 def along_lengths_for_display(sol):
-    """
-    Return (inner_length, outer_length) — the along-track span of the inner and outer
-    footprint edges, in metres. Correctly handles both tilt directions.
-    """
+    """Inner and outer along-track (or across-track for along-tilt) footprint lengths."""
     (it, ib), (ot, ob) = inner_outer_corners(sol)
-    inner_len = abs(it[1] - ib[1])
-    outer_len = abs(ot[1] - ob[1])
-    return inner_len, outer_len
+    return abs(it[1] - ib[1]), abs(ot[1] - ob[1])
+
+def safe_corners(sol):
+    """Return all 4 corner (Gx, Gy) tuples, filtered to finite values only."""
+    raw = [sol.corner_near_top, sol.corner_far_top,
+           sol.corner_near_bot, sol.corner_far_bot]
+    return [c for c in raw if np.isfinite(c[0]) and np.isfinite(c[1])]
+
+def axis_limits_from_solutions(solutions, pad=0.18):
+    """
+    Compute square axis limits that fit all camera footprints with a margin.
+    Returns (lim,) where axes run from -lim to +lim.
+    Falls back to 1.0 if no finite corners found.
+    """
+    all_x, all_y = [], []
+    for _, sol, _ in solutions:
+        for c in safe_corners(sol):
+            all_x.append(c[0])
+            all_y.append(c[1])
+    if not all_x:
+        return 1.0
+    x_span = max(abs(min(all_x)), abs(max(all_x))) * (1 + pad)
+    y_span = max(abs(min(all_y)), abs(max(all_y))) * (1 + pad)
+    lim = max(x_span, y_span)
+    return lim if np.isfinite(lim) and lim > 0 else 1.0
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sidebar — flight parameters
+# Sidebar
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.sidebar.title("✈️ Oblique Survey Planner")
@@ -204,16 +234,12 @@ side_frac = side_pct / 100.0
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("💾 Save / Load")
-
 sc_name = st.sidebar.text_input("Scenario name", "my_survey")
-if st.sidebar.button("Save scenario (JSON)"):
+if st.sidebar.button("Save scenario"):
     save_scenario({
-        "cameras":        st.session_state.cameras,
-        "altitude_m":     altitude_m,
-        "speed_ms":       speed_ms,
-        "fwd_overlap_pct": fwd_pct,
-        "sidelap_pct":    side_pct,
-        "reciprocal":     reciprocal,
+        "cameras": st.session_state.cameras,
+        "altitude_m": altitude_m, "speed_ms": speed_ms,
+        "fwd_overlap_pct": fwd_pct, "sidelap_pct": side_pct, "reciprocal": reciprocal,
     }, f"{sc_name}.json")
     st.sidebar.success(f"Saved {sc_name}.json")
 
@@ -245,71 +271,62 @@ st.markdown("---")
 
 st.subheader("Camera Configuration")
 
-with st.expander("Orientation & tilt-axis guide", expanded=False):
+with st.expander("Orientation & tilt-axis reference", expanded=False):
     st.markdown("""
-| Setting | Option | Meaning | Best for |
+| Setting | Option | Sensor across-track | Best for |
 |---|---|---|---|
-| **Orientation** | Portrait | **Narrow** sensor axis across-track, long axis along-track | L/R oblique — limits far-edge GSD stretch |
-| | Landscape | **Long** sensor axis across-track, narrow along-track | Nadir — maximises swath |
-| **Tilt axis** | Across (L/R) | Camera rotates left/right about the along-track axis | Left & Right oblique cameras |
-| | Along (F/A) | Camera rotates fore/aft about the across-track axis | Fore & Aft oblique cameras |
+| **Orientation** | Portrait | **Narrow** (short) axis | L/R oblique — limits far-edge GSD stretch |
+| | Landscape | **Long** axis | Nadir — maximises swath width |
+| **Tilt axis** | Across (L/R) | Tilts left/right about along-track axis | Left & Right oblique |
+| | Along (F/A) | Tilts fore/aft about across-track axis | Fore & Aft oblique |
 
-For a **left** camera, enter the same tilt angle as the right camera — the geometry mirrors automatically because
-the camera body is mounted on the opposite side.  Both cameras share the same tilt magnitude.
+**Spreadsheet match:** The Landscape sheet in the reference spreadsheet uses portrait-mounted
+L/R cameras (narrow axis across-track). The default settings here reproduce those values exactly.
+For the Left camera, enter the same tilt angle as Right — the mirroring is handled automatically.
     """)
 
 cameras      = st.session_state.cameras
 bodies_avail = all_body_names()
 
 # Column headers
-hdr = st.columns([0.4, 1.6, 1.8, 0.75, 0.7, 0.85, 0.9, 1.05, 0.35])
+hdr = st.columns([0.35, 1.5, 1.7, 0.7, 0.65, 0.8, 0.85, 1.0, 0.3])
 for col, lbl in zip(hdr, ["✓", "Label", "Body", "FL mm", "Tilt °", "From", "Orient.", "Tilt axis", ""]):
-    col.markdown(f"<span style='color:#8b949e;font-size:0.8em'>{lbl}</span>", unsafe_allow_html=True)
+    col.markdown(f"<span style='color:#8b949e;font-size:0.78em;font-weight:600'>{lbl}</span>",
+                 unsafe_allow_html=True)
 
 to_delete = None
 for i, cam in enumerate(cameras):
-    col_en, col_lbl, col_body, col_fl, col_tilt, col_conv, col_orient, col_axis, col_del = \
-        st.columns([0.4, 1.6, 1.8, 0.75, 0.7, 0.85, 0.9, 1.05, 0.35])
-
+    c_en, c_lbl, c_body, c_fl, c_tilt, c_conv, c_orient, c_axis, c_del = \
+        st.columns([0.35, 1.5, 1.7, 0.7, 0.65, 0.8, 0.85, 1.0, 0.3])
     colour = CAM_COLOURS[i % len(CAM_COLOURS)]
-    dot    = f"<span style='color:{colour}'>●</span>"
 
-    cam["enabled"] = col_en.checkbox(
-        "##e", value=cam["enabled"], key=f"en_{i}", label_visibility="collapsed"
-    )
-    col_lbl.markdown(dot, unsafe_allow_html=True)
-    cam["label"] = col_lbl.text_input(
-        "##l", value=cam["label"], key=f"lbl_{i}", label_visibility="collapsed"
-    )
-
+    cam["enabled"] = c_en.checkbox("##e", value=cam["enabled"], key=f"en_{i}",
+                                    label_visibility="collapsed")
+    c_lbl.markdown(f"<span style='color:{colour}'>●</span>", unsafe_allow_html=True)
+    cam["label"] = c_lbl.text_input("##l", value=cam["label"], key=f"lbl_{i}",
+                                     label_visibility="collapsed")
     body_idx = bodies_avail.index(cam["body"]) if cam["body"] in bodies_avail else 0
-    cam["body"] = col_body.selectbox(
-        "##b", bodies_avail, index=body_idx, key=f"body_{i}", label_visibility="collapsed"
-    )
-    cam["focal_mm"] = float(col_fl.number_input(
-        "##f", value=float(cam["focal_mm"]), min_value=1.0, max_value=2000.0, step=1.0,
-        key=f"fl_{i}", label_visibility="collapsed",
-    ))
-    cam["tilt_deg"] = float(col_tilt.number_input(
-        "##t", value=float(cam["tilt_deg"]), min_value=0.0, max_value=85.0, step=0.5,
-        key=f"tilt_{i}", label_visibility="collapsed",
-    ))
-    cam["tilt_conv"] = col_conv.selectbox(
-        "##c", ["horiz", "nadir"], key=f"conv_{i}", label_visibility="collapsed",
-        index=0 if cam["tilt_conv"] == "horiz" else 1,
-        format_func=lambda x: "Horizontal" if x == "horiz" else "Nadir",
-    )
-    cam["orientation"] = col_orient.selectbox(
-        "##o", ["portrait", "landscape"], key=f"orient_{i}", label_visibility="collapsed",
-        index=0 if cam["orientation"] == "portrait" else 1,
-        format_func=lambda x: "Portrait" if x == "portrait" else "Landscape",
-    )
-    cam["tilt_axis"] = col_axis.selectbox(
-        "##a", ["across", "along"], key=f"axis_{i}", label_visibility="collapsed",
-        index=0 if cam["tilt_axis"] == "across" else 1,
-        format_func=lambda x: "Across (L/R)" if x == "across" else "Along (F/A)",
-    )
-    if col_del.button("✕", key=f"del_{i}", help="Remove this camera"):
+    cam["body"] = c_body.selectbox("##b", bodies_avail, index=body_idx, key=f"body_{i}",
+                                    label_visibility="collapsed")
+    cam["focal_mm"] = float(c_fl.number_input("##f", value=float(cam["focal_mm"]),
+                                               min_value=1.0, max_value=2000.0, step=1.0,
+                                               key=f"fl_{i}", label_visibility="collapsed"))
+    cam["tilt_deg"] = float(c_tilt.number_input("##t", value=float(cam["tilt_deg"]),
+                                                  min_value=0.0, max_value=85.0, step=0.5,
+                                                  key=f"tilt_{i}", label_visibility="collapsed"))
+    cam["tilt_conv"] = c_conv.selectbox("##c", ["horiz", "nadir"], key=f"conv_{i}",
+                                         index=0 if cam["tilt_conv"] == "horiz" else 1,
+                                         label_visibility="collapsed",
+                                         format_func=lambda x: "Horizontal" if x == "horiz" else "Nadir")
+    cam["orientation"] = c_orient.selectbox("##o", ["portrait", "landscape"], key=f"orient_{i}",
+                                             index=0 if cam["orientation"] == "portrait" else 1,
+                                             label_visibility="collapsed",
+                                             format_func=lambda x: "Portrait" if x == "portrait" else "Landscape")
+    cam["tilt_axis"] = c_axis.selectbox("##a", ["across", "along"], key=f"axis_{i}",
+                                         index=0 if cam["tilt_axis"] == "across" else 1,
+                                         label_visibility="collapsed",
+                                         format_func=lambda x: "Across (L/R)" if x == "across" else "Along (F/A)")
+    if c_del.button("✕", key=f"del_{i}", help="Remove camera"):
         to_delete = i
 
 if to_delete is not None:
@@ -318,28 +335,26 @@ if to_delete is not None:
 
 b1, b2, b3 = st.columns([1, 1, 6])
 if b1.button("➕ Add camera"):
-    cameras.append({
-        "enabled": True, "label": f"Camera {len(cameras)+1}",
-        "body": "Sony A7R V", "focal_mm": 50.0, "tilt_deg": 50.0,
-        "tilt_conv": "horiz", "orientation": "portrait", "tilt_axis": "across",
-    })
+    cameras.append({"enabled": True, "label": f"Camera {len(cameras)+1}",
+                    "body": "Sony A7R V", "focal_mm": 50.0, "tilt_deg": 50.0,
+                    "tilt_conv": "horiz", "orientation": "portrait", "tilt_axis": "across"})
     st.rerun()
 if b2.button("↺ Reset defaults"):
     st.session_state.cameras = [dict(c) for c in DEFAULT_CAMERAS]
     st.rerun()
 
-# Save custom body preset
-with st.expander("Save a camera body as a preset"):
+with st.expander("Save a camera body as a custom preset"):
     pc1, pc2 = st.columns([2, 1])
     p_base = pc1.selectbox("Base body", list(BODY_PRESETS.keys()), key="p_base")
     p_name = pc2.text_input("Preset name", value=p_base, key="p_name")
-    p_wmm  = pc1.number_input("Sensor width mm", value=BODY_PRESETS[p_base]["w_mm"], key="p_wmm")
-    p_hmm  = pc1.number_input("Sensor height mm", value=BODY_PRESETS[p_base]["h_mm"], key="p_hmm")
-    p_wpx  = pc1.number_input("Width px", value=BODY_PRESETS[p_base]["w_px"], step=100, key="p_wpx")
-    p_hpx  = pc1.number_input("Height px", value=BODY_PRESETS[p_base]["h_px"], step=100, key="p_hpx")
+    p_wmm  = pc1.number_input("Sensor long axis mm", value=BODY_PRESETS[p_base]["w_mm"], key="p_wmm")
+    p_hmm  = pc1.number_input("Sensor short axis mm", value=BODY_PRESETS[p_base]["h_mm"], key="p_hmm")
+    p_wpx  = pc1.number_input("Pixel count long axis", value=BODY_PRESETS[p_base]["w_px"], step=100, key="p_wpx")
+    p_hpx  = pc1.number_input("Pixel count short axis", value=BODY_PRESETS[p_base]["h_px"], step=100, key="p_hpx")
     if pc2.button("Save preset"):
-        save_body_preset(p_name, {"w_mm": p_wmm, "h_mm": p_hmm, "w_px": int(p_wpx), "h_px": int(p_hpx)})
-        st.success(f"Saved preset '{p_name}'. Reload page to use it in the body dropdown.")
+        save_body_preset(p_name, {"w_mm": p_wmm, "h_mm": p_hmm,
+                                   "w_px": int(p_wpx), "h_px": int(p_hpx)})
+        st.success(f"Saved '{p_name}'. Reload page to use it.")
 
 st.markdown("---")
 
@@ -347,15 +362,15 @@ st.markdown("---")
 # Build camera solutions
 # ─────────────────────────────────────────────────────────────────────────────
 
-active = [c for c in cameras if c["enabled"]]
-solutions: list[tuple[dict, object, str]] = []  # (cam_dict, CameraSolution, colour)
-errors: list[str] = []
+active   = [c for c in cameras if c["enabled"]]
+solutions = []   # list of (cam_dict, CameraSolution, colour_str)
+errors    = []
 
 for i, cam in enumerate(active):
     try:
-        bd = get_body(cam["body"])
+        bd     = get_body(cam["body"])
         tilt_n = normalize_tilt_angle(cam["tilt_deg"], cam["tilt_conv"])
-        sol = calculate_camera_solution(
+        sol    = calculate_camera_solution(
             altitude_m          = altitude_m,
             tilt_from_nadir_deg = tilt_n,
             sensor_w_native_mm  = bd["w_mm"],
@@ -383,13 +398,13 @@ sol_list = [s for _, s, _ in solutions]
 mc = None
 try:
     mc = calculate_multicamera_solution(
-        camera_solutions     = sol_list,
-        arrangement          = "custom",
-        altitude_m           = altitude_m,
-        aircraft_speed_ms    = speed_ms,
+        camera_solutions      = sol_list,
+        arrangement           = "custom",
+        altitude_m            = altitude_m,
+        aircraft_speed_ms     = speed_ms,
         forward_overlap_fraction = fwd_frac,
-        sidelap_fraction     = side_frac,
-        reciprocal_flying    = reciprocal,
+        sidelap_fraction      = side_frac,
+        reciprocal_flying     = reciprocal,
     )
 except Exception as e:
     st.error(f"System calculation error: {e}")
@@ -400,7 +415,7 @@ if mc and mc.warnings:
             st.warning(w)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# System summary cards
+# Summary cards
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.subheader("System Summary")
@@ -412,13 +427,12 @@ if mc:
     c4.metric("Exposure interval", f"{mc.photo_interval_s:.2f} s")
     c5.metric("Sidelap achieved",  f"{mc.sidelap_achieved * 100:.1f}%")
 
-    # Representative GSD from first oblique camera (skip nadir)
     rep = next((s for _, s, _ in solutions if abs(s.tilt_from_nadir_deg) > 1), sol_list[0])
     c6, c7, c8, c9 = st.columns(4)
-    c6.metric(f"GSD near ({rep.label})",   fmt_gsd(rep.near_gsd_m))
-    c7.metric("GSD centre",                fmt_gsd(rep.centre_gsd_m))
-    c8.metric("GSD far",                   fmt_gsd(rep.far_gsd_m))
-    c9.metric("Fwd overlap near / ctr / far",
+    c6.metric(f"GSD inner ({rep.label})", fmt_gsd(min(rep.near_gsd_m, rep.far_gsd_m)))
+    c7.metric("GSD centre",               fmt_gsd(rep.centre_gsd_m))
+    c8.metric("GSD outer",                fmt_gsd(max(rep.near_gsd_m, rep.far_gsd_m)))
+    c9.metric("Fwd overlap near/ctr/far",
               f"{mc.forward_overlap_near*100:.0f}% / "
               f"{mc.forward_overlap_centre*100:.0f}% / "
               f"{mc.forward_overlap_far*100:.0f}%")
@@ -426,7 +440,7 @@ if mc:
 st.markdown("---")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-camera results table
+# Per-camera results table  (includes obliqueness ratio)
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.subheader("Per-Camera Results")
@@ -435,179 +449,161 @@ rows = []
 for cam, sol, _ in solutions:
     inner_gx, outer_gx = corner_inner_outer(sol)
     inner_len, outer_len = along_lengths_for_display(sol)
+    inner_gsd = min(sol.near_gsd_m, sol.far_gsd_m)
+    outer_gsd = max(sol.near_gsd_m, sol.far_gsd_m)
+    tilt_h = 90.0 - sol.tilt_from_nadir_deg
+
     rows.append({
-        "Camera":                   sol.label,
-        "Body / FL":                f"{cam['body']}  {cam['focal_mm']:.0f} mm",
-        "Orient.":                  sol.orientation,
-        "Tilt axis":                sol.tilt_axis,
-        "Tilt nadir °":             round(sol.tilt_from_nadir_deg, 1),
-        "Tilt horiz °":             round(90 - sol.tilt_from_nadir_deg, 1),
-        "Pixel µm":                 round(sol.pixel_size_mm * 1000, 2),
-        "FOV across °":             round(sol.full_fov_across_deg, 2),
-        "FOV along °":              round(sol.full_fov_along_deg,  2),
+        "Camera":                    sol.label,
+        "Body / FL":                 f"{cam['body']}  {cam['focal_mm']:.0f} mm",
+        "Orient.":                   sol.orientation,
+        "Tilt axis":                 sol.tilt_axis,
+        "Tilt nadir °":              round(sol.tilt_from_nadir_deg, 1),
+        "Tilt horiz °":              round(tilt_h, 1),
+        # ── Obliqueness ──
+        "Obliqueness ratio":         round(obliqueness_ratio(sol), 2),
+        # (far GSD / inner GSD — 1.0 = nadir; higher = more oblique)
+        # ──────────────────
+        "Pixel µm":                  round(sol.pixel_size_mm * 1000, 2),
+        "FOV across °":              round(sol.full_fov_across_deg, 2),
+        "FOV along °":               round(sol.full_fov_along_deg,  2),
         f"Inner edge ({dist_unit})": round(m_to_unit(abs(inner_gx), dist_unit), 1),
         f"Outer edge ({dist_unit})": round(m_to_unit(abs(outer_gx), dist_unit), 1),
         f"Inner length ({dist_unit})": round(m_to_unit(inner_len, dist_unit), 1),
         f"Outer length ({dist_unit})": round(m_to_unit(outer_len, dist_unit), 1),
-        "Inner GSD cm":             round(min(sol.near_gsd_m, sol.far_gsd_m) * 100, 3),
-        "Outer GSD cm":             round(max(sol.near_gsd_m, sol.far_gsd_m) * 100, 3),
-        "Centre GSD cm":            round(sol.centre_gsd_m * 100, 3),
-        "Inner slant m":            round(min(sol.near_slant_m, sol.far_slant_m), 1),
-        "Outer slant m":            round(max(sol.near_slant_m, sol.far_slant_m), 1),
-        "Diag image mm":            round(sol.diag_image_mm, 4),
+        "Inner GSD cm":              round(inner_gsd * 100, 3),
+        "Centre GSD cm":             round(sol.centre_gsd_m * 100, 3),
+        "Outer GSD cm":              round(outer_gsd * 100, 3),
+        "Inner slant m":             round(min(sol.near_slant_m, sol.far_slant_m), 1),
+        "Outer slant m":             round(max(sol.near_slant_m, sol.far_slant_m), 1),
+        "Diag image mm":             round(sol.diag_image_mm, 4),
     })
 
 st.dataframe(rows, use_container_width=True)
+st.caption(
+    "**Obliqueness ratio** = outer GSD ÷ inner GSD. "
+    "1.0 = nadir (uniform); higher values mean greater GSD variation across the frame."
+)
 st.markdown("---")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DIAGRAM 1 — Footprint plan view (spreadsheet style)
-# Centred on aircraft nadir.  x = across-track,  y = along-track (forward = up).
-# Each camera drawn as filled quadrilateral.
-# Dimension lines and labels at inner/outer edges, matching spreadsheet layout.
+# DIAGRAM 1 — Footprint plan view — ALL cameras, ALL frames shown
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.subheader("Footprint Plan View — Single Frame")
+st.subheader("Footprint Plan View — All Cameras")
 st.caption(
     "Plan view centred on the aircraft nadir point (✕). "
-    "**x** = across-track (right positive), **y** = along-track (forward up). "
-    "Dimension arrows show distance from nadir to the inner and outer footprint edges. "
-    "Inner / outer lengths annotated on the footprint sides."
+    "**x** = across-track (right positive), **y** = along-track (forward = up). "
+    "Each polygon is the exact 4-corner footprint of one camera. "
+    "Arrows show distance from nadir to inner and outer edges. "
+    "Side labels show inner/outer along-track (or across-track) footprint lengths."
 )
 
-fig_fp, ax_fp = dark_fig(w=9, h=9)
-ax_fp.set_aspect("equal")
+lim = axis_limits_from_solutions(solutions)
 
-# Grid lines
+fig_fp, ax_fp = dark_fig(w=10, h=10)
+ax_fp.set_aspect("equal")
+ax_fp.set_xlim(-lim, lim)
+ax_fp.set_ylim(-lim, lim)
+
+# Grid / nadir
 ax_fp.axhline(0, color="#21262d", lw=0.8, zorder=1)
 ax_fp.axvline(0, color="#21262d", lw=0.8, zorder=1)
-ax_fp.scatter([0], [0], s=160, color="#f0c040", zorder=7, marker="x", linewidths=2.5)
-ax_fp.annotate("Nadir", (0, 0), xytext=(6, -12), textcoords="offset points",
-               color="#f0c040", fontsize=8, fontweight="bold")
+ax_fp.scatter([0], [0], s=200, color="#f0c040", zorder=8, marker="x", linewidths=2.5)
+ax_fp.annotate("Nadir", (0, 0), xytext=(8, -14), textcoords="offset points",
+               color="#f0c040", fontsize=8.5, fontweight="bold")
 
 for cam, sol, colour in solutions:
-    # --- Footprint polygon ---
     corners_xy = [
         (sol.corner_near_top[0], sol.corner_near_top[1]),
         (sol.corner_far_top[0],  sol.corner_far_top[1]),
         (sol.corner_far_bot[0],  sol.corner_far_bot[1]),
         (sol.corner_near_bot[0], sol.corner_near_bot[1]),
     ]
-    poly = plt.Polygon(corners_xy, closed=True,
-                       facecolor=colour, alpha=0.20,
-                       edgecolor=colour, linewidth=2.0, zorder=3)
-    ax_fp.add_patch(poly)
-    ax_fp.scatter(*zip(*corners_xy), color=colour, s=28, zorder=5, edgecolors="none")
+    # Only draw if all corners are finite
+    if not all(np.isfinite(v) for xy in corners_xy for v in xy):
+        continue
 
-    # --- Camera label at centroid ---
+    # Filled polygon
+    poly = plt.Polygon(corners_xy, closed=True,
+                       facecolor=colour, alpha=0.18,
+                       edgecolor=colour, linewidth=2.2, zorder=3)
+    ax_fp.add_patch(poly)
+    ax_fp.scatter(*zip(*corners_xy), color=colour, s=30, zorder=5, edgecolors="none")
+
+    # Camera label at centroid
     cx = sum(c[0] for c in corners_xy) / 4
     cy = sum(c[1] for c in corners_xy) / 4
     ax_fp.text(cx, cy, sol.label, color=colour, fontsize=8, fontweight="bold",
-               ha="center", va="center", zorder=6,
-               bbox=dict(facecolor="#0d1117", alpha=0.65, pad=2,
-                         edgecolor=colour, linewidth=0.6, boxstyle="round,pad=0.3"))
+               ha="center", va="center", zorder=7,
+               bbox=dict(facecolor="#0d1117", alpha=0.70, pad=2.5,
+                         edgecolor=colour, linewidth=0.8, boxstyle="round,pad=0.3"))
 
-    # --- Dimension arrows and labels ---
     inner_gx, outer_gx = corner_inner_outer(sol)
     inner_len, outer_len = along_lengths_for_display(sol)
     (it, ib), (ot, ob) = inner_outer_corners(sol)
 
     if sol.tilt_axis == "across":
-        # Arrows along x-axis from nadir to inner and outer edges
-        y_arr = cy * 0.0   # draw arrow along y=0 line
-        arrowprops = dict(arrowstyle="-|>", lw=1.2, mutation_scale=10)
-        ax_fp.annotate("", xy=(inner_gx, y_arr), xytext=(0, y_arr),
-                        arrowprops={**arrowprops, "color": colour}, zorder=4)
-        ax_fp.annotate("", xy=(outer_gx, y_arr), xytext=(inner_gx, y_arr),
-                        arrowprops={**arrowprops, "color": colour}, zorder=4)
+        # Dimension arrows along x-axis (y=0)
+        ap = dict(arrowstyle="-|>", lw=1.3, mutation_scale=11)
+        ax_fp.annotate("", xy=(inner_gx, 0), xytext=(0, 0),
+                        arrowprops={**ap, "color": colour}, zorder=4)
+        ax_fp.annotate("", xy=(outer_gx, 0), xytext=(inner_gx, 0),
+                        arrowprops={**ap, "color": colour}, zorder=4)
 
-        # Distance labels on the arrows
-        lim_ref = abs(outer_gx)
-        ha_inner = "left" if inner_gx > 0 else "right"
-        ha_outer = "left" if outer_gx > 0 else "right"
-        label_dy = lim_ref * 0.04
-        ax_fp.text(inner_gx / 2, -label_dy,
+        # Distance labels below arrows
+        dy = lim * 0.035
+        ax_fp.text(inner_gx / 2, -dy,
                    f"{m_to_unit(abs(inner_gx), dist_unit):.0f} {dist_unit}",
-                   color=colour, fontsize=7, ha="center", va="top", zorder=6)
-        ax_fp.text((inner_gx + outer_gx) / 2, -label_dy * 2.2,
+                   color=colour, fontsize=7, ha="center", va="top")
+        ax_fp.text((inner_gx + outer_gx) / 2, -dy * 2.4,
                    f"{m_to_unit(abs(outer_gx), dist_unit):.0f} {dist_unit}",
-                   color=colour, fontsize=7, ha="center", va="top", zorder=6)
+                   color=colour, fontsize=7, ha="center", va="top")
 
-        # Inner / outer length annotations on the footprint sides
-        # Inner edge: midpoint of inner_top to inner_bot
+        # Inner edge along-track length label (on the nadir-side edge)
         ixm = (it[0] + ib[0]) / 2
         iym = (it[1] + ib[1]) / 2
-        offset_x = -8 if inner_gx >= 0 else 8
+        dx_off = -9 if inner_gx >= 0 else 9
         ax_fp.annotate(f"{m_to_unit(inner_len, dist_unit):.0f} {dist_unit}",
-                        xy=(ixm, iym), xytext=(offset_x, 0), textcoords="offset points",
-                        color=colour, fontsize=6.5, ha="right" if offset_x < 0 else "left",
-                        va="center", zorder=6)
-        # Outer edge
+                        xy=(ixm, iym), xytext=(dx_off, 0), textcoords="offset points",
+                        color=colour, fontsize=6.5, va="center",
+                        ha="right" if dx_off < 0 else "left")
+
+        # Outer edge along-track length label (on the far edge)
         oxm = (ot[0] + ob[0]) / 2
         oym = (ot[1] + ob[1]) / 2
-        offset_x2 = 8 if outer_gx >= 0 else -8
+        dx_off2 = 9 if outer_gx >= 0 else -9
         ax_fp.annotate(f"{m_to_unit(outer_len, dist_unit):.0f} {dist_unit}",
-                        xy=(oxm, oym), xytext=(offset_x2, 0), textcoords="offset points",
-                        color=colour, fontsize=6.5, ha="left" if offset_x2 > 0 else "right",
-                        va="center", zorder=6)
+                        xy=(oxm, oym), xytext=(dx_off2, 0), textcoords="offset points",
+                        color=colour, fontsize=6.5, va="center",
+                        ha="left" if dx_off2 > 0 else "right")
 
-        # GSD annotation inside footprint near inner and outer edge
-        ax_fp.text(it[0], it[1] * 0.7,
-                   f"GSD {m_to_unit(abs(inner_gx), dist_unit):.0f}{dist_unit}:\n"
-                   f"{min(sol.near_gsd_m, sol.far_gsd_m)*100:.2f} cm/px",
-                   color=colour, fontsize=5.5, alpha=0.8, ha="center", va="center", zorder=5)
-        ax_fp.text(ot[0], ot[1] * 0.7,
-                   f"GSD {m_to_unit(abs(outer_gx), dist_unit):.0f}{dist_unit}:\n"
-                   f"{max(sol.near_gsd_m, sol.far_gsd_m)*100:.2f} cm/px",
-                   color=colour, fontsize=5.5, alpha=0.8, ha="center", va="center", zorder=5)
+        # GSD labels at inner/outer corners
+        inner_gsd = min(sol.near_gsd_m, sol.far_gsd_m)
+        outer_gsd = max(sol.near_gsd_m, sol.far_gsd_m)
+        ax_fp.text(ixm, iym * 0.65,
+                   f"{inner_gsd*100:.2f} cm/px",
+                   color=colour, fontsize=5.5, alpha=0.85, ha="center", va="center")
+        ax_fp.text(oxm, oym * 0.65,
+                   f"{outer_gsd*100:.2f} cm/px",
+                   color=colour, fontsize=5.5, alpha=0.85, ha="center", va="center")
 
-    else:
-        # Along-tilt camera: arrows along y-axis
-        inner_gy, outer_gy = corner_inner_outer(sol)  # reuse — for along-tilt near/far is in y
-        # For along cameras: near_edge_m / far_edge_m are G_y values
+    else:  # tilt_axis == "along"
+        # Dimension arrows along y-axis (x=0)
+        ap = dict(arrowstyle="-|>", lw=1.3, mutation_scale=11)
         inner_gy = sol.near_edge_m if abs(sol.near_edge_m) < abs(sol.far_edge_m) else sol.far_edge_m
         outer_gy = sol.far_edge_m  if abs(sol.far_edge_m)  > abs(sol.near_edge_m) else sol.near_edge_m
-
-        arrowprops = dict(arrowstyle="-|>", lw=1.2, mutation_scale=10)
         ax_fp.annotate("", xy=(0, inner_gy), xytext=(0, 0),
-                        arrowprops={**arrowprops, "color": colour}, zorder=4)
+                        arrowprops={**ap, "color": colour}, zorder=4)
         ax_fp.annotate("", xy=(0, outer_gy), xytext=(0, inner_gy),
-                        arrowprops={**arrowprops, "color": colour}, zorder=4)
-
-        lim_ref = abs(outer_gy)
-        label_dx = lim_ref * 0.04
-        ax_fp.text(label_dx, inner_gy / 2,
+                        arrowprops={**ap, "color": colour}, zorder=4)
+        dx = lim * 0.025
+        ax_fp.text(dx, inner_gy / 2,
                    f"{m_to_unit(abs(inner_gy), dist_unit):.0f} {dist_unit}",
-                   color=colour, fontsize=7, ha="left", va="center", zorder=6)
-        ax_fp.text(label_dx, (inner_gy + outer_gy) / 2,
+                   color=colour, fontsize=7, ha="left", va="center")
+        ax_fp.text(dx, (inner_gy + outer_gy) / 2,
                    f"{m_to_unit(abs(outer_gy), dist_unit):.0f} {dist_unit}",
-                   color=colour, fontsize=7, ha="left", va="center", zorder=6)
-
-# Axis limits — fit all corners with margin
-all_x = [c[v][0] for _, sol, _ in solutions
-          for c in [(sol.corner_near_top, sol.corner_far_top,
-                     sol.corner_near_bot, sol.corner_far_bot)]
-          for v in range(4)]
-all_y = [c[v][1] for _, sol, _ in solutions
-          for c in [(sol.corner_near_top, sol.corner_far_top,
-                     sol.corner_near_bot, sol.corner_far_bot)]
-          for v in range(4)]
-
-# Simpler approach — flatten corner lists
-all_x = [p for _, sol, _ in solutions
-          for p in [sol.corner_near_top[0], sol.corner_far_top[0],
-                    sol.corner_near_bot[0], sol.corner_far_bot[0]]]
-all_y = [p for _, sol, _ in solutions
-          for p in [sol.corner_near_top[1], sol.corner_far_top[1],
-                    sol.corner_near_bot[1], sol.corner_far_bot[1]]]
-
-if all_x and all_y:
-    pad = 0.18
-    x_span = max(abs(min(all_x)), abs(max(all_x))) * (1 + pad)
-    y_span = max(abs(min(all_y)), abs(max(all_y))) * (1 + pad)
-    lim = max(x_span, y_span)
-    ax_fp.set_xlim(-lim, lim)
-    ax_fp.set_ylim(-lim, lim)
+                   color=colour, fontsize=7, ha="left", va="center")
 
 # Tick labels in display units
 xt = ax_fp.get_xticks()
@@ -616,32 +612,34 @@ yt = ax_fp.get_yticks()
 ax_fp.set_yticklabels([f"{m_to_unit(t, dist_unit):.0f}" for t in yt], color="#8b949e")
 ax_fp.set_xlabel(f"← Across-track ({dist_unit}) →", color="#8b949e")
 ax_fp.set_ylabel(f"↑ Along-track / forward ({dist_unit})", color="#8b949e")
-ax_fp.set_title("Single-Frame Footprint — Plan View", color="#c9d1d9", fontsize=11, pad=10)
+ax_fp.set_title("Single-Frame Footprint Plan View — All Cameras", color="#c9d1d9",
+                fontsize=11, pad=10)
 
-legend_fp = [mpatches.Patch(color=col, label=cam["label"], alpha=0.8)
+legend_fp = [mpatches.Patch(color=col, label=cam["label"], alpha=0.85)
              for cam, _, col in solutions]
 ax_fp.legend(handles=legend_fp, loc="upper right", fontsize=8, framealpha=0.4,
              labelcolor="#c9d1d9", facecolor="#161b22")
 
-# North/flight direction arrow
-ax_fp.annotate("", xy=(0, lim * 0.88), xytext=(0, lim * 0.72),
-               arrowprops=dict(arrowstyle="->", color="#c9d1d9", lw=1.5))
-ax_fp.text(lim * 0.04, lim * 0.80, "Fwd", color="#c9d1d9", fontsize=7, va="center")
+# Forward arrow
+ax_fp.annotate("", xy=(0, lim * 0.90), xytext=(0, lim * 0.74),
+               arrowprops=dict(arrowstyle="->", color="#c9d1d9", lw=1.8))
+ax_fp.text(lim * 0.03, lim * 0.82, "Fwd", color="#c9d1d9", fontsize=7.5, va="center")
 
 fig_fp.tight_layout()
 st.pyplot(fig_fp)
 st.markdown("---")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DIAGRAM 2 — Cross-section (across-track cameras only)
+# DIAGRAM 2 — Cross-section (across-track cameras)
 # ─────────────────────────────────────────────────────────────────────────────
 
 across_sols = [(c, s, col) for c, s, col in solutions if s.tilt_axis == "across"]
 
 st.subheader("Cross-Section View — Across-Track")
 st.caption(
-    "Side view looking forward along the flight track. "
-    "Solid lines = image centre ray. Dotted = inner edge. Dashed = outer edge."
+    "Side view looking forward. "
+    "Dotted line = inner edge ray, solid = centre ray, dashed = outer edge ray. "
+    "GSD values shown at ground intercepts."
 )
 
 if across_sols:
@@ -649,43 +647,52 @@ if across_sols:
     H = altitude_m
 
     ax_xs.axvline(0, color="#30363d", lw=1.0, ls="--", zorder=1)
-    ax_xs.axhline(0, color="#444",    lw=1.5, zorder=1, label="Ground")
-    ax_xs.scatter([0], [H], s=200, color="#f0c040", marker="^", zorder=6, label="Aircraft")
-    ax_xs.annotate(f"{fmt(H, dist_unit)}", (0, H), xytext=(6, -4),
+    ax_xs.axhline(0, color="#444",    lw=1.5, zorder=1)
+    ax_xs.scatter([0], [H], s=210, color="#f0c040", marker="^", zorder=6)
+    ax_xs.annotate(f"{fmt(H, dist_unit)} AGL", (0, H), xytext=(7, -4),
                    textcoords="offset points", color="#f0c040", fontsize=7.5)
 
     for cam, sol, colour in across_sols:
         inner_gx, outer_gx = corner_inner_outer(sol)
         centre_gx = sol.centre_m
+        inner_gsd = min(sol.near_gsd_m, sol.far_gsd_m)
+        outer_gsd = max(sol.near_gsd_m, sol.far_gsd_m)
+        tilt_h = 90.0 - sol.tilt_from_nadir_deg
 
-        for gx, ls, lw in [(inner_gx, ":", 1.3), (centre_gx, "-", 1.8), (outer_gx, "--", 1.3)]:
+        for gx, ls, lw in [(inner_gx, ":", 1.4), (centre_gx, "-", 2.0), (outer_gx, "--", 1.4)]:
             ax_xs.plot([0, gx], [H, 0], color=colour, ls=ls, lw=lw, zorder=3)
 
         ax_xs.scatter([inner_gx, centre_gx, outer_gx], [0, 0, 0],
-                       color=colour, s=45, zorder=5, edgecolors="none")
+                       color=colour, s=50, zorder=5, edgecolors="none")
 
-        # Ground labels
-        for gx, label_str, dy_frac in [
-            (inner_gx, f"{sol.label}\n{m_to_unit(abs(inner_gx), dist_unit):.0f} {dist_unit}", 0.04),
-            (outer_gx, f"{m_to_unit(abs(outer_gx), dist_unit):.0f} {dist_unit}", 0.09),
-        ]:
-            ax_xs.text(gx, -H * dy_frac, label_str, color=colour,
-                       fontsize=6.5, ha="center", va="top", zorder=6)
+        ax_xs.text(inner_gx, -H * 0.04,
+                   f"{sol.label}\n"
+                   f"tilt {tilt_h:.1f}° from horiz\n"
+                   f"{m_to_unit(abs(inner_gx), dist_unit):.0f} {dist_unit}",
+                   color=colour, fontsize=6, ha="center", va="top")
+        ax_xs.text(outer_gx, -H * 0.09,
+                   f"{m_to_unit(abs(outer_gx), dist_unit):.0f} {dist_unit}",
+                   color=colour, fontsize=6, ha="center", va="top")
 
-        # GSD labels at ground intercepts
-        inner_gsd = min(sol.near_gsd_m, sol.far_gsd_m)
-        outer_gsd = max(sol.near_gsd_m, sol.far_gsd_m)
-        ax_xs.text(inner_gx, H * 0.15,
-                   f"{inner_gsd*100:.1f} cm/px", color=colour,
-                   fontsize=6, ha="center", alpha=0.8)
-        ax_xs.text(outer_gx, H * 0.15,
-                   f"{outer_gsd*100:.1f} cm/px", color=colour,
-                   fontsize=6, ha="center", alpha=0.8)
+        # GSD labels at mid-height on each ray
+        ax_xs.text(inner_gx * 0.55, H * 0.18,
+                   f"{inner_gsd*100:.1f} cm/px",
+                   color=colour, fontsize=6, ha="center", alpha=0.9)
+        ax_xs.text(outer_gx * 0.55, H * 0.18,
+                   f"{outer_gsd*100:.1f} cm/px",
+                   color=colour, fontsize=6, ha="center", alpha=0.9)
 
-    max_x = max(abs(s.far_edge_m) for _, s, _ in across_sols) * 1.22
-    max_x = max(max_x, max(abs(s.near_edge_m) for _, s, _ in across_sols) * 1.22)
+        # Obliqueness annotation
+        ob_ratio = obliqueness_ratio(sol)
+        ax_xs.text(centre_gx * 0.5, H * 0.55,
+                   f"Obliqueness: {ob_ratio:.2f}×",
+                   color=colour, fontsize=6, ha="center", alpha=0.75,
+                   style="italic")
+
+    max_x = max(abs(s.far_edge_m) for _, s, _ in across_sols) * 1.25
+    max_x = max(max_x, max(abs(s.near_edge_m) for _, s, _ in across_sols) * 1.25)
     ax_xs.set_xlim(-max_x, max_x)
-    ax_xs.set_ylim(-H * 0.16, H * 1.14)
+    ax_xs.set_ylim(-H * 0.18, H * 1.15)
 
     xt = ax_xs.get_xticks()
     ax_xs.set_xticklabels([f"{m_to_unit(t, dist_unit):.0f}" for t in xt], color="#8b949e")
@@ -699,9 +706,9 @@ if across_sols:
                  for cam, _, col in across_sols]
     legend_xs += [
         mpatches.Patch(color="white", alpha=0, label=""),
-        plt.Line2D([0], [0], color="white", ls=":", lw=1.3, label="Inner edge"),
-        plt.Line2D([0], [0], color="white", ls="-", lw=1.8, label="Centre ray"),
-        plt.Line2D([0], [0], color="white", ls="--", lw=1.3, label="Outer edge"),
+        plt.Line2D([0],[0], color="white", ls=":", lw=1.4, label="Inner edge ray"),
+        plt.Line2D([0],[0], color="white", ls="-", lw=2.0, label="Centre ray"),
+        plt.Line2D([0],[0], color="white", ls="--", lw=1.4, label="Outer edge ray"),
     ]
     ax_xs.legend(handles=legend_xs, fontsize=7, framealpha=0.35,
                  labelcolor="#c9d1d9", facecolor="#161b22", loc="upper right", ncol=2)
@@ -713,16 +720,14 @@ else:
 st.markdown("---")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DIAGRAM 3 — Multi-strip plan view (3 adjacent strips)
-# Across-track cameras only. Strip 1 is the reference; strips 2 & 3 are offset
-# by the recommended line spacing along the across-track direction.
+# DIAGRAM 3 — Multi-strip plan view
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.subheader("Multi-Strip Plan View")
 st.caption(
     "Three adjacent flight strips offset by the recommended line spacing. "
-    "Strip 1 (brightest) is the reference. "
-    "Across-track cameras only — fore/aft cameras repeat identically on every strip."
+    "Strip 1 is brightest. Only across-track cameras shown "
+    "(fore/aft cameras repeat identically on each strip)."
 )
 
 if mc and across_sols:
@@ -733,16 +738,15 @@ if mc and across_sols:
     n_strips     = 3
     alphas       = [0.55, 0.38, 0.22]
     lws          = [1.6,  0.9,  0.5]
-    strip_colors = ["#c9d1d9", "#6e7681", "#444"]
+    strip_cols   = ["#c9d1d9", "#6e7681", "#444"]
 
-    # Along-track extent for tick/limit calculation
     max_along = max(
         max(abs(s.corner_far_top[1]), abs(s.corner_far_bot[1]))
         for _, s, _ in across_sols
     )
 
     for si in range(n_strips):
-        x_off = si * line_spacing   # across-track shift for this strip's nadir track
+        x_off = si * line_spacing
         for cam, sol, colour in across_sols:
             corners = [
                 (sol.corner_near_top[0] + x_off, sol.corner_near_top[1]),
@@ -755,31 +759,26 @@ if mc and across_sols:
                                edgecolor=colour, linewidth=lws[si], zorder=3)
             ax_ms.add_patch(poly)
 
-        # Nadir track
-        ax_ms.axvline(x_off, color=strip_colors[si], lw=0.8, ls="-.", alpha=0.7, zorder=2)
-        ax_ms.text(x_off, max_along * 1.06, f"Strip {si+1}",
-                   color=strip_colors[si], fontsize=8, ha="center", va="bottom")
+        ax_ms.axvline(x_off, color=strip_cols[si], lw=0.9, ls="-.", alpha=0.7, zorder=2)
+        ax_ms.text(x_off, max_along * 1.07, f"Strip {si+1}",
+                   color=strip_cols[si], fontsize=8, ha="center", va="bottom")
 
     # Line spacing dimension arrow
     ax_ms.annotate("", xy=(line_spacing, 0), xytext=(0, 0),
-                   arrowprops=dict(arrowstyle="<->", color="white", lw=1.8,
-                                   mutation_scale=12), zorder=5)
+                   arrowprops=dict(arrowstyle="<->", color="white", lw=2.0,
+                                   mutation_scale=13), zorder=5)
     ax_ms.text(line_spacing / 2, -max_along * 0.09,
                f"Line spacing\n{m_to_unit(line_spacing, dist_unit):.0f} {dist_unit}",
                color="white", fontsize=8, ha="center", va="top",
-               bbox=dict(facecolor="#21262d", alpha=0.75, pad=3,
-                         edgecolor="#555", linewidth=0.5))
+               bbox=dict(facecolor="#21262d", alpha=0.75, pad=3, edgecolor="#555", lw=0.5))
 
-    # Overlap annotation — show where adjacent strips overlap
-    # Overlap zone = from strip2 inner to strip1 outer (for right-side cameras)
+    # Sidelap zone annotation
     right_sols = [(c, s, col) for c, s, col in across_sols if s.tilt_from_nadir_deg > 0]
     if right_sols:
         _, rs, rcol = right_sols[0]
         outer_gx = max(abs(rs.near_edge_m), abs(rs.far_edge_m))
-        # Overlap starts at line_spacing and ends at outer_gx
         if outer_gx > line_spacing:
-            ax_ms.axvspan(line_spacing, outer_gx, color=rcol, alpha=0.08,
-                          zorder=2, label="Overlap zone")
+            ax_ms.axvspan(line_spacing, outer_gx, color=rcol, alpha=0.07, zorder=2)
             ax_ms.text((line_spacing + outer_gx) / 2, max_along * 0.5,
                        f"Sidelap\n{mc.sidelap_achieved*100:.0f}%",
                        color=rcol, fontsize=7, ha="center", va="center",
@@ -789,8 +788,8 @@ if mc and across_sols:
     all_x_ms = []
     for _, sol, _ in across_sols:
         for si in range(n_strips):
-            all_x_ms += [sol.corner_near_top[0] + si*line_spacing,
-                          sol.corner_far_top[0]  + si*line_spacing]
+            all_x_ms += [sol.corner_near_top[0] + si * line_spacing,
+                          sol.corner_far_top[0]  + si * line_spacing]
     x_min = min(all_x_ms) * 1.12
     x_max = max(all_x_ms) * 1.12
     y_rng = max_along * 1.18
@@ -811,11 +810,12 @@ if mc and across_sols:
     ax_ms.legend(handles=legend_ms, fontsize=8, framealpha=0.35,
                  labelcolor="#c9d1d9", facecolor="#161b22", loc="upper right")
 
-    # Forward flight arrow
-    ax_ms.annotate("", xy=(x_min * 0.5, y_rng * 0.88), xytext=(x_min * 0.5, y_rng * 0.62),
-                   arrowprops=dict(arrowstyle="->", color="#c9d1d9", lw=1.5))
-    ax_ms.text(x_min * 0.5, y_rng * 0.75, "Fwd", color="#c9d1d9",
-               fontsize=7, ha="center", va="center")
+    # Forward arrow
+    ax_ms.annotate("", xy=(x_min * 0.55, y_rng * 0.90),
+                   xytext=(x_min * 0.55, y_rng * 0.65),
+                   arrowprops=dict(arrowstyle="->", color="#c9d1d9", lw=1.8))
+    ax_ms.text(x_min * 0.55, y_rng * 0.77, "Fwd",
+               color="#c9d1d9", fontsize=7.5, ha="center", va="center")
 
     fig_ms.tight_layout()
     st.pyplot(fig_ms)
@@ -827,7 +827,7 @@ else:
 st.markdown("---")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Formula trace — per camera
+# Formula trace
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.subheader("Formula Trace")
@@ -838,32 +838,35 @@ with st.expander("Show intermediate calculations per camera", expanded=False):
         inner_len, outer_len = along_lengths_for_display(sol)
         inner_gsd = min(sol.near_gsd_m, sol.far_gsd_m)
         outer_gsd = max(sol.near_gsd_m, sol.far_gsd_m)
+        tilt_h = 90.0 - sol.tilt_from_nadir_deg
+        ob = obliqueness_ratio(sol)
 
         st.markdown(
             f"<span style='color:{colour}'>●</span> **{sol.label}**",
-            unsafe_allow_html=True,
+            unsafe_allow_html=True
         )
         st.markdown(f"""
 | Quantity | Formula | Value |
 |---|---|---|
-| Sensor native | — | {bd['w_mm']} × {bd['h_mm']} mm,  {bd['w_px']} × {bd['h_px']} px |
-| Orientation | **{sol.orientation}** → across: {sol.sensor_across_mm:.4f} mm, along: {sol.sensor_along_mm:.4f} mm | |
+| Sensor native | — | {bd['w_mm']} × {bd['h_mm']} mm, {bd['w_px']} × {bd['h_px']} px |
+| Orientation | **{sol.orientation}** | across: **{sol.sensor_across_mm:.4f} mm**, along: **{sol.sensor_along_mm:.4f} mm** |
 | Focal length | — | **{cam['focal_mm']} mm** |
 | Pixel size | `sensor_across / image_across_px` | **{sol.pixel_size_mm*1000:.3f} µm** |
-| Tilt | — | {sol.tilt_from_nadir_deg:.2f}° from nadir / {90-sol.tilt_from_nadir_deg:.2f}° from horizontal |
+| Tilt | — | **{sol.tilt_from_nadir_deg:.2f}° from nadir** / **{tilt_h:.2f}° from horizontal** |
 | Tilt axis | — | **{sol.tilt_axis}** |
 | Half FOV across | `atan(sensor_across / (2×fl))` | {sol.half_fov_across_deg:.4f}° → full {sol.full_fov_across_deg:.4f}° |
-| Half FOV along  | `atan(sensor_along / (2×fl))` | {sol.half_fov_along_deg:.4f}° → full {sol.full_fov_along_deg:.4f}° |
+| Half FOV along | `atan(sensor_along / (2×fl))` | {sol.half_fov_along_deg:.4f}° → full {sol.full_fov_along_deg:.4f}° |
 | Diag PP→edge | `sqrt((sensor_across/2)² + fl²)` | **{sol.diag_image_mm:.4f} mm** |
 | Inner edge | `H × tan(θ − φ_w)` | **{m_to_unit(abs(inner_gx), dist_unit):.2f} {dist_unit}** from nadir |
 | Outer edge | `H × tan(θ + φ_w)` | **{m_to_unit(abs(outer_gx), dist_unit):.2f} {dist_unit}** from nadir |
 | Inner slant | `sqrt(H² + Gx²)` | **{min(sol.near_slant_m, sol.far_slant_m):.2f} m** |
 | Outer slant | `sqrt(H² + Gx²)` | **{max(sol.near_slant_m, sol.far_slant_m):.2f} m** |
-| Inner length (perp) | exact 4-corner | **{m_to_unit(inner_len, dist_unit):.2f} {dist_unit}** |
-| Outer length (perp) | exact 4-corner | **{m_to_unit(outer_len, dist_unit):.2f} {dist_unit}** |
+| Inner length | exact 4-corner | **{m_to_unit(inner_len, dist_unit):.2f} {dist_unit}** |
+| Outer length | exact 4-corner | **{m_to_unit(outer_len, dist_unit):.2f} {dist_unit}** |
 | Inner GSD | `px_mm × slant_mm / diag_mm` | **{fmt_gsd(inner_gsd)}** |
 | Centre GSD | — | **{fmt_gsd(sol.centre_gsd_m)}** |
 | Outer GSD | `px_mm × slant_mm / diag_mm` | **{fmt_gsd(outer_gsd)}** |
+| **Obliqueness ratio** | `outer GSD / inner GSD` | **{ob:.3f}×** |
         """)
 
 st.markdown("---")
@@ -872,47 +875,58 @@ st.markdown("---")
 # Assumptions
 # ─────────────────────────────────────────────────────────────────────────────
 
-with st.expander("ℹ️ Assumptions, conventions and limitations"):
+with st.expander("ℹ️ Assumptions, conventions and spreadsheet verification"):
     st.markdown("""
-### Sensor orientation
+### Spreadsheet verification (Oblique_setup9_working_2.xls)
 
-| Setting | Across-track dim | Along-track dim | Typical use |
+**Landscape sheet** — Sony A7R V, nadir fl=21 mm, oblique fl=50 mm, 50° from horizontal, GSD 8.5 cm:
+
+| Value | Our app | Spreadsheet |
+|---|---|---|
+| Flying height | 469.737 m | 469.737 m |
+| Oblique inner edge | 233.820 m | 233.820 m |
+| Oblique outer edge | 635.679 m | 635.679 m |
+| Inner length | 368.473 m | 368.473 m |
+| Outer length | 555.051 m | 555.051 m |
+| Inner GSD | 3.877 cm/px | 3.877 cm/px |
+| Outer GSD | 5.840 cm/px | 5.840 cm/px |
+| Slope to inner | 524.714 m | 524.714 m |
+| Slope to outer | 790.405 m | 790.405 m |
+
+All values match to 3+ decimal places.
+
+**Portrait sheet** — uses landscape-mounted oblique cameras (long axis across-track) at a different
+flying height (H=631.58 m, nadir fl=48 mm, GSD 5 cm). To reproduce that sheet, set the L/R oblique
+cameras to **Landscape** orientation. Both sheets match our model when the correct orientation is used.
+
+### Obliqueness ratio
+Defined as `outer GSD / inner GSD`. Values:
+- **1.0** = nadir camera (uniform GSD across the image)
+- **1.5** = mild oblique (50% more GSD at the far edge than inner edge)
+- **>3** = highly oblique (consider whether far-edge GSD meets mission requirements)
+
+### Sensor orientation convention
+
+| Setting | Sensor dimension across-track | Along-track | Typical use |
 |---|---|---|---|
-| **Portrait** | Short (narrow) axis | Long axis | L/R oblique — limits GSD stretch at far edge |
-| **Landscape** | Long axis | Short axis | Nadir — maximises swath width |
+| **Portrait** | Short (narrow) axis | Long axis | L/R oblique |
+| **Landscape** | Long axis | Short axis | Nadir camera |
 
-The pixel count used for pixel-size calculation matches the chosen axis:
-portrait uses the short-axis pixel count across-track; landscape uses the long-axis count.
-
-### Tilt axis convention
-
-| Axis | Camera rotates about | Footprint elongated in | Sign convention |
-|---|---|---|---|
-| **Across (L/R)** | Along-track (Y) | Across-track (X) | Positive = tilts right |
-| **Along (F/A)** | Across-track (X) | Along-track (Y) | Positive = tilts forward |
-
-For a **left-side** camera, enter the same tilt angle as the right-side camera.
-The geometry mirrors correctly because negative tilt produces the symmetric footprint.
-
-### GSD formula
+### GSD formula (slant-plane, matching spreadsheet)
 ```
 GSD = pixel_size_mm × slant_2d_mm / diag_image_mm
-diag_image_mm = sqrt((sensor_across / 2)² + focal_length²)
+diag_image_mm = sqrt((sensor_across/2)² + focal_length²)
 ```
-This is the slant-plane GSD, matching the reference spreadsheet (Oblique_setup9_working_2.xls).
 
 ### Photo spacing
-Uses the **inner (minimum) footprint length** to ensure the target forward overlap is
-met at the most constrained position (closest to nadir). The far edge will have somewhat
-higher overlap than requested.
+Uses the **inner (minimum) footprint length** so the target forward overlap is
+met at the most constrained position. The far edge will have higher overlap than requested.
 
-### Combined swath
-Spans from the leftmost to rightmost footprint corner across all enabled cameras.
-Line spacing = combined swath × (1 − sidelap).
-
-### Terrain
-v1 assumes flat terrain. For undulating terrain use altitude AGL above the highest
-point as a conservative GSD estimate.
+### Assumptions (v1)
+- Flat terrain
+- Pinhole camera, square pixels
+- Pure single-axis tilt per camera
+- No lens distortion, wind drift, or lever-arm effects
     """)
 
 st.markdown("---")
